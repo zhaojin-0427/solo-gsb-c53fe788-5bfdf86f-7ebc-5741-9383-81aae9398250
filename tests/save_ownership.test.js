@@ -15,7 +15,13 @@
  *      方案），但旧名称不得覆盖新草稿；
  *   5. 连续保存：较早响应不得回退较新的绑定（无论到达先后）；
  *   6. 正常保存：绑定 ID、回写名称、弹出提示，且不误删有效协调结果；
- *   7. 当前保存失败：照常报错。
+ *   7. 当前保存失败：照常报错；
+ *   8. 打开等待期内保存旧页：B 落地后 A 的迟到回执只留服务端结果——
+ *      不抢绑定、不覆盖名称、不弹提示，后续保存覆盖 B；
+ *   9. 打开等待期内保存旧页、打开失败：保留 A 的编辑内容与原有绑定，
+ *      等待期内发出的保存回执仍正常落地；
+ *  10. 同一新方案连发两次 POST：较早成功、较新失败时回收已创建 ID，
+ *      后续保存覆盖同一方案（PUT），不重复新建（两种到达顺序）。
  */
 "use strict";
 
@@ -316,6 +322,132 @@ const driver = `
   await savePlan();
   t("当前保存失败：照常报错",
     $el("#toast").textContent.includes("保存失败"));
+
+  // 8. 打开等待期内保存旧页：B 落地后，A 的迟到回执只留服务端结果
+  newPlan(false);
+  setValidPlan("方案A");
+  const dLoadB = __deferred();
+  const dSaveA2 = __deferred();
+  globalThis.__fetchImpl = (url, opts) => {
+    if (url === "/api/plans/9" && !opts) return dLoadB.p; // GET 打开 B
+    if (url === "/api/plans" && (opts || {}).method === "POST") return dSaveA2.p;
+    return unexpected(url);
+  };
+  const pLoadB = loadPlan(9);   // 发起打开 B（GET 在途）
+  const pSaveA2 = savePlan();   // 等待期内保存旧页 A（POST 在途）
+  dLoadB.resolve({ ok: true, json: async () => PLAN_B_REC });
+  await pLoadB;
+  t("打开等待期内保存旧页：B 正常落地",
+    state.planId === 9 && plan.name === "乙方案");
+  $el("#toast").textContent = "";
+  dSaveA2.resolve({ ok: true, json: async () => ({ id: 3, name: "方案A" }) });
+  await pSaveA2;
+  t("等待期保存的迟到回执：不把 B 绑到 A", state.planId === 9);
+  t("等待期保存的迟到回执：名称框不被旧名覆盖",
+    $el("#planName").value === "乙方案");
+  t("等待期保存的迟到回执：不弹保存成功提示",
+    !$el("#toast").textContent.includes("已保存"));
+  let url8 = null, method8 = null;
+  globalThis.__fetchImpl = (url, opts) => {
+    url8 = url; method8 = (opts || {}).method;
+    return okJson({ id: 9, name: "乙方案" });
+  };
+  await savePlan();
+  t("等待期保存后：后续保存覆盖 B 而非 A",
+    url8 === "/api/plans/9" && method8 === "PUT");
+
+  // 9. 打开等待期内保存旧页、打开失败：保留 A 的编辑与绑定，等待期保存仍落地
+  newPlan(false);
+  setValidPlan("方案A9");
+  globalThis.__fetchImpl = (url, opts) => {
+    if (url === "/api/plans" && (opts || {}).method === "POST")
+      return okJson({ id: 40, name: "方案A9" });
+    return unexpected(url);
+  };
+  await savePlan();
+  t("前置：A 已保存并绑定 #40", state.planId === 40);
+  const dLoadF = __deferred();
+  const dSaveA9 = __deferred();
+  globalThis.__fetchImpl = (url, opts) => {
+    if (url === "/api/plans/9" && !opts) return dLoadF.p; // GET 打开 B
+    if (url === "/api/plans/40" && (opts || {}).method === "PUT") return dSaveA9.p;
+    return unexpected(url);
+  };
+  const pLoadF = loadPlan(9);   // 发起打开 B（GET 在途）
+  const pSaveA9 = savePlan();   // 等待期内保存旧页 A（PUT /40 在途）
+  dLoadF.resolve({ ok: false, status: 500, json: async () => ({}) });
+  await pLoadF;
+  t("打开失败：保留 A 的编辑内容与原有绑定",
+    state.planId === 40 && plan.name === "方案A9");
+  t("打开失败：弹出错误提示",
+    $el("#toast").textContent.includes("打开失败"));
+  $el("#toast").textContent = "";
+  dSaveA9.resolve({ ok: true, json: async () => ({ id: 40, name: "方案A9" }) });
+  await pSaveA9;
+  t("打开失败：等待期发出的保存回执仍正常落地",
+    state.planId === 40 && $el("#toast").textContent.includes("已保存"));
+
+  // 10. 同一新方案连发两次 POST：较早成功、较新失败——回收已创建 ID
+  // 顺序一：较早成功先到（较新在途）→ 暂不绑定；较新失败 → 回收该 ID
+  newPlan(false);
+  setValidPlan("连保3");
+  let postN = 0;
+  const e1 = __deferred(), e2 = __deferred();
+  globalThis.__fetchImpl = (url, opts) => {
+    if (url === "/api/plans" && (opts || {}).method === "POST") {
+      postN++;
+      return postN === 1 ? e1.p : e2.p;
+    }
+    return unexpected(url);
+  };
+  const q1 = savePlan();
+  const q2 = savePlan();
+  e1.resolve({ ok: true, json: async () => ({ id: 50, name: "连保3" }) });
+  await q1;
+  t("较早成功先到（较新在途）：暂不绑定", state.planId === null);
+  $el("#toast").textContent = "";
+  e2.resolve({ ok: false, status: 500, json: async () => ({ detail: "冲突" }) });
+  await q2;
+  t("较新保存失败：照常报错",
+    $el("#toast").textContent.includes("保存失败"));
+  t("较新保存失败：回收较早创建的 ID", state.planId === 50);
+  let url10 = null, method10 = null;
+  globalThis.__fetchImpl = (url, opts) => {
+    url10 = url; method10 = (opts || {}).method;
+    return okJson({ id: 50, name: "连保3" });
+  };
+  await savePlan();
+  t("回收后保存覆盖同一方案（PUT），不重复新建",
+    url10 === "/api/plans/50" && method10 === "PUT");
+  // 顺序二：较新失败先到，较早成功后到 → 成功回执直接采用已创建 ID
+  newPlan(false);
+  setValidPlan("连保4");
+  postN = 0;
+  const e3 = __deferred(), e4 = __deferred();
+  globalThis.__fetchImpl = (url, opts) => {
+    if (url === "/api/plans" && (opts || {}).method === "POST") {
+      postN++;
+      return postN === 1 ? e3.p : e4.p;
+    }
+    return unexpected(url);
+  };
+  const q3 = savePlan();
+  const q4 = savePlan();
+  e4.resolve({ ok: false, status: 500, json: async () => ({ detail: "冲突" }) });
+  await q4;
+  t("较新失败先到：报错且暂无绑定",
+    state.planId === null && $el("#toast").textContent.includes("保存失败"));
+  e3.resolve({ ok: true, json: async () => ({ id: 51, name: "连保4" }) });
+  await q3;
+  t("较早成功后到（较新已失败）：直接采用已创建 ID", state.planId === 51);
+  let url11 = null, method11 = null;
+  globalThis.__fetchImpl = (url, opts) => {
+    url11 = url; method11 = (opts || {}).method;
+    return okJson({ id: 51, name: "连保4" });
+  };
+  await savePlan();
+  t("采用后保存覆盖同一方案（PUT），不重复新建",
+    url11 === "/api/plans/51" && method11 === "PUT");
 
   const failed = results.filter(([, ok]) => !ok).length;
   console.log("\\n" + (results.length - failed) + "/" + results.length + " 通过");

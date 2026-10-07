@@ -14,9 +14,18 @@ const state = {
   // 不必等响应回来即可作废该请求并释放求解按钮。
   pendingKey: null,
   // 保存请求归属序号：每次保存递增；方案上下文切换（新建/打开/删除当前
-  // 方案）同样递增。响应回来时序号不匹配即为过期保存：成功只保留服务端
-  // 保存结果，不得把当前页面绑回旧方案；失败不对当前页报错。
+  // 方案）同样递增。
   saveSeq: 0,
+  // 方案上下文代际：新建/打开（发起与落地）/删除当前方案时递增。
+  // 保存响应按“代际 + 序号”裁决：跨代际的回执一律不得回写页面——
+  // 成功只保留服务端保存结果，失败不对当前页报错。
+  planCtx: 0,
+  // 在途保存请求序号（响应落定即移除）：被较新保存取代的成功回执到达时，
+  // 用于判断是否仍有较新保存在途（在途则不得直接绑定，待其回执再裁决）。
+  savesInFlight: new Set(),
+  // 同一上下文内被较新保存取代、但已在服务端创建成功的方案 { seq, id }：
+  // 较新保存失败时回收该 ID，供后续覆盖保存，避免重复新建。
+  staleCreated: null,
   planMenuOpen: false,
 };
 
@@ -291,12 +300,21 @@ function collectPlan() {
 //   * 新建/打开/删除当前方案会递增 solveSeq 并清空结果；打开请求在发起
 //     那一刻即切换上下文，等待期内到达的旧响应一律过期，读取失败保留
 //     当前编辑内容。
-//   * 保存响应同样按归属裁决：发起保存时记录请求序号、方案绑定、名称
-//     草稿与输入指纹；响应回来时序号已过期（方案切换/新建，或又发起了
-//     更新的保存）则一律不回写页面——成功只保留服务端保存结果，失败
-//     不报错；仍是当前请求时，成功创建的 ID 写回 planId 供后续覆盖保存，
-//     但仅当草稿（含名称）自发起起未变时才回写名称，旧名称不得覆盖新
-//     草稿；连续保存的较早响应不得回退较新的绑定。
+//   * 保存响应按“方案上下文代际 + 请求序号”裁决归属：
+//       - 发起保存时记录请求序号、上下文代际、方案绑定、名称草稿与
+//         输入指纹；
+//       - 打开请求在发起那一刻切换上下文，落地那一刻再次切换——等待期
+//         内旧页发出的保存，其迟到回执只保留服务端结果，不把新页面绑回
+//         旧方案；打开失败则不再切换，保留当前编辑内容与原有绑定，等待
+//         期内发出的保存对当前页仍然有效；
+//       - 跨代际的回执一律不回写页面：成功只保留服务端保存结果，失败
+//         不对当前页报错；
+//       - 仍是本上下文最后一次保存时，成功创建的 ID 写回 planId 供后续
+//         覆盖保存，但仅当草稿（含名称）自发起起未变时才回写名称，旧名
+//         称不得覆盖新草稿；
+//       - 同一方案被较新保存取代的创建成功：较新保存在途时暂记已创建
+//         ID，较新保存失败时回收该 ID 供覆盖保存（不重复新建）；已落地
+//         的较新绑定不得被旧回执回退。
 // 指纹只含影响求解与展示的字段（方案名称不影响协调结果，不计入）。
 
 function planFingerprint() {
@@ -349,11 +367,14 @@ function setSolveBusy(busy) {
 }
 
 // 方案上下文切换（新建/打开/删除当前方案）：
-// 作废旧求解与旧保存请求、撤下旧结果、复位求解按钮。
+// 作废旧求解与旧保存请求、撤下旧结果、复位求解按钮；旧上下文的
+// “已创建 ID 回收记录”不得带入新页面。
 function switchPlanContext() {
   state.solveSeq++;
   state.saveSeq++;
+  state.planCtx++;
   state.pendingKey = null;
+  state.staleCreated = null;
   invalidateResult();
   setSolveBusy(false);
 }
@@ -709,14 +730,17 @@ async function savePlan() {
     toast(errs[0] + (errs.length > 1 ? ` 等 ${errs.length} 项错误` : ""), true);
     return;
   }
-  // 保存归属判定：记录发起时刻的请求序号、方案绑定、名称草稿与输入指纹
+  // 保存归属判定：记录发起时刻的请求序号、方案上下文代际、方案绑定、
+  // 名称草稿与输入指纹
   const reqId = ++state.saveSeq;
+  const reqCtx = state.planCtx;
   const reqPlanId = state.planId;
   const reqName = plan.name;
   const reqKey = planFingerprint();
   const payload = toApiPayload(plan);
-  // 序号已过期（方案切换/新建，或又发起了更新的保存）的响应不得更新页面
-  const isCurrent = () => reqId === state.saveSeq;
+  state.savesInFlight.add(reqId);
+  // 仍是本上下文中的最后一次保存，响应才允许完整回写页面
+  const isCurrent = () => reqCtx === state.planCtx && reqId === state.saveSeq;
   // 草稿（含名称）自发起起未变，才允许把服务端名称回写到名称框
   const draftIntact = () =>
     reqKey === planFingerprint() && reqName === plan.name;
@@ -740,19 +764,44 @@ async function savePlan() {
       throw new Error(d.detail || `HTTP ${resp.status}`);
     }
     const saved = await resp.json();
-    // 过期成功响应：服务端保存结果保留，但当前页面的方案绑定与名称草稿
-    // 一律不动——迟到响应不得把切换后的页面绑回旧方案
-    if (!isCurrent()) return;
-    // 成功创建的 ID 仍写回：后续保存覆盖同一方案，而非重复新建
-    state.planId = saved.id;
-    // 等待期内草稿已变：旧名称不得覆盖新草稿
-    if (draftIntact()) {
-      $("#planName").value = saved.name;
+    // 跨上下文（方案已切换/新建，或打开已落地）：成功只保留服务端保存
+    // 结果——不得把当前页面绑回旧方案、不得覆盖名称、不弹提示
+    if (reqCtx !== state.planCtx) return;
+    if (isCurrent()) {
+      // 成功创建的 ID 写回：后续保存覆盖同一方案，而非重复新建
+      state.planId = saved.id;
+      state.staleCreated = null; // 较新绑定已落地，回收记录作废
+      // 等待期内草稿已变：旧名称不得覆盖新草稿
+      if (draftIntact()) {
+        $("#planName").value = saved.name;
+      }
+      toast(`方案「${saved.name}」已保存（#${saved.id}）`);
+    } else if (state.planId == null) {
+      // 同一方案被较新保存取代的创建成功：较新保存仍在途时不得直接绑定
+      // （其回执将再裁决），先暂记已创建 ID——若较新保存失败，该 ID 回收
+      // 用于覆盖保存；较新保存已落定且未留下绑定（即已失败）时，直接采用。
+      const newerInFlight = [...state.savesInFlight].some((id) => id > reqId);
+      if (newerInFlight) {
+        if (!state.staleCreated || reqId > state.staleCreated.seq) {
+          state.staleCreated = { seq: reqId, id: saved.id };
+        }
+      } else {
+        state.planId = saved.id;
+        state.staleCreated = null;
+      }
     }
-    toast(`方案「${saved.name}」已保存（#${saved.id}）`);
+    // 已有较新绑定落地（state.planId 非空）：旧回执不得回退，一律不动
   } catch (e) {
-    if (!isCurrent()) return; // 过期失败响应：不对当前页报错
+    // 跨上下文或被较新保存取代的失败：不对当前页报错
+    if (!isCurrent()) return;
+    // 较新保存失败：回收同方案较早保存已创建的 ID，供后续覆盖保存
+    if (state.planId == null && state.staleCreated) {
+      state.planId = state.staleCreated.id;
+    }
+    state.staleCreated = null;
     toast("保存失败：" + e.message, true);
+  } finally {
+    state.savesInFlight.delete(reqId);
   }
 }
 
@@ -810,6 +859,10 @@ async function loadPlan(id) {
     if (!resp.ok) throw new Error(`HTTP ${resp.status}`);
     const rec = await resp.json();
     if (reqId !== state.solveSeq) return; // 过期成功响应：不得回填
+    // 落地那一刻再次切换方案上下文：等待期内旧页发出的保存随之过期——
+    // 其迟到回执只保留服务端结果，不得把新页面绑回旧方案；若打开失败
+    // 则不切换，等待期内发出的保存对当前页仍然有效。
+    switchPlanContext();
     const d = rec.plan;
     plan = {
       name: d.name,
