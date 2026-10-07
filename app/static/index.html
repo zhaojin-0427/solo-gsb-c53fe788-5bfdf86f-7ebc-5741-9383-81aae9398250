@@ -1,0 +1,68 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>无线话筒频点协调台</title>
+<link rel="stylesheet" href="/static/style.css">
+</head>
+<body>
+<header class="topbar">
+  <h1>🎙️ 无线话筒频点协调台</h1>
+  <div class="top-actions">
+    <input id="planName" type="text" placeholder="方案名称" maxlength="60">
+    <button id="btnNew" class="btn">新建方案</button>
+    <button id="btnOpen" class="btn">打开方案 ▾</button>
+    <button id="btnSave" class="btn btn-primary">保存方案</button>
+  </div>
+</header>
+
+<main>
+<section class="panel params">
+  <h2>全局参数</h2>
+  <div class="param-grid">
+    <label>最小频差 d（kHz，正整数）
+      <input id="minGap" type="number" min="1" step="1" value="5">
+    </label>
+    <label>互调容差 g（kHz，非负）
+      <input id="imTolerance" type="number" min="0" step="1" value="0">
+    </label>
+    <label>求解时限（秒，正整数）
+      <input id="timeLimit" type="number" min="1" step="1" value="10">
+    </label>
+  </div>
+  <div class="forbidden-row">
+    <span class="field-label">禁用闭区间（kHz，含端点）：</span>
+    <div id="bands" class="bands"></div>
+    <button id="btnAddBand" class="btn btn-small">＋ 添加禁用区间</button>
+  </div>
+  <div class="solve-row">
+    <button id="btnSolve" class="btn btn-solve">▶ 协调求解</button>
+    <button id="btnAddMic" class="btn">＋ 添加话筒（2～8 支）</button>
+  </div>
+</section>
+
+<section class="panel">
+  <h2>话筒清单</h2>
+  <div id="mics" class="mics"></div>
+</section>
+
+<section class="panel" id="resultPanel" hidden>
+  <h2>协调结果</h2>
+  <div id="statusBanner" class="banner"></div>
+  <div id="conflicts" class="conflicts"></div>
+  <div id="resultSummary" class="summary"></div>
+  <canvas id="spectrum" width="1100" height="320"></canvas>
+  <div id="resultTable" class="result-table"></div>
+  <details id="phaseDetails">
+    <summary>求解阶段明细</summary>
+    <pre id="phaseLog"></pre>
+  </details>
+</section>
+</main>
+
+<ul id="planMenu" class="plan-menu" hidden></ul>
+
+<script src="/static/app.js"></script>
+</body>
+</html>
